@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,26 +60,35 @@ def model_dtype(device: torch.device) -> torch.dtype:
     return torch.float16
 
 
+def autocast_context(device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+
+    return torch.autocast(
+        device_type="cuda",
+        dtype=model_dtype(device),
+    )
+
+
 def load_models(config: PPOConfig) -> PPOModels:
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    dtype = model_dtype(device)
-    model_kwargs = {"torch_dtype": dtype}
+    inference_dtype = model_dtype(device)
 
     actor = AutoModelForCausalLM.from_pretrained(
         config.actor_model_name,
-        **model_kwargs,
+        dtype=torch.float32,
     ).to(device)
 
     reference = AutoModelForCausalLM.from_pretrained(
         config.actor_model_name,
-        **model_kwargs,
+        dtype=inference_dtype,
     ).to(device)
 
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         config.reward_model_name,
-        **model_kwargs,
+        dtype=inference_dtype,
     ).to(device)
 
     reward_tokenizer = AutoTokenizer.from_pretrained(

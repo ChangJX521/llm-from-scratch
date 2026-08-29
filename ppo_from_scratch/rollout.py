@@ -7,7 +7,7 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from .config import PPOConfig
-from .models import PPOModels
+from .models import PPOModels, autocast_context
 
 
 @dataclass
@@ -145,7 +145,7 @@ def generate_sequences(
         ).to(device)
         padded_prompt_length = model_inputs["input_ids"].shape[1]
 
-        with torch.inference_mode():
+        with torch.inference_mode(), autocast_context(device):
             generated_ids = actor.generate(
                 **model_inputs,
                 max_new_tokens=config.max_new_tokens,
@@ -256,7 +256,7 @@ def generate_evaluation_responses(
         ).to(device)
         prompt_length = model_inputs["input_ids"].shape[1]
 
-        with torch.inference_mode():
+        with torch.inference_mode(), autocast_context(device):
             generated_ids = model.generate(
                 **model_inputs,
                 max_new_tokens=config.max_new_tokens,
@@ -303,7 +303,7 @@ def score_responses(
             return_tensors="pt",
         ).to(models.device)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), autocast_context(models.device):
             logits = models.reward_model(**reward_inputs).logits
 
         batch_scores = logits.reshape(logits.shape[0], -1)[:, 0]
@@ -393,30 +393,55 @@ def collect_rollout(
     models.actor.eval()
     models.value_head.eval()
 
-    with torch.inference_mode():
-        actor_outputs = models.actor(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        old_logprobs = token_logprobs(
-            actor_outputs.logits,
-            input_ids,
-        ).float()
-        old_values = models.value_head(
-            actor_outputs.hidden_states[-1][:, :-1]
-        )
+    old_logprob_batches = []
+    old_value_batches = []
+    reference_logprob_batches = []
 
-        reference_outputs = models.reference(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-        reference_logprobs = token_logprobs(
-            reference_outputs.logits,
-            input_ids,
-        ).float()
+    for start in range(
+        0,
+        input_ids.shape[0],
+        config.generation_batch_size,
+    ):
+        end = start + config.generation_batch_size
+        batch_input_ids = input_ids[start:end]
+        batch_attention_mask = attention_mask[start:end]
+
+        with torch.inference_mode(), autocast_context(models.device):
+            actor_outputs = models.actor(
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            old_logprob_batches.append(
+                token_logprobs(
+                    actor_outputs.logits,
+                    batch_input_ids,
+                ).float()
+            )
+            old_value_batches.append(
+                models.value_head(
+                    actor_outputs.hidden_states[-1][:, :-1]
+                )
+            )
+            del actor_outputs
+
+            reference_outputs = models.reference(
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+                use_cache=False,
+            )
+            reference_logprob_batches.append(
+                token_logprobs(
+                    reference_outputs.logits,
+                    batch_input_ids,
+                ).float()
+            )
+            del reference_outputs
+
+    old_logprobs = torch.cat(old_logprob_batches)
+    old_values = torch.cat(old_value_batches)
+    reference_logprobs = torch.cat(reference_logprob_batches)
 
     reward_scores = score_responses(
         models=models,

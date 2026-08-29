@@ -5,7 +5,7 @@ from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from .config import PPOConfig
-from .models import PPOModels, save_checkpoint
+from .models import PPOModels, autocast_context, save_checkpoint
 from .reporting import TrainingReporter
 from .rollout import (
     RolloutBatch,
@@ -39,6 +39,28 @@ class PPOTrainer:
         )
 
     def train(self, dataset: Dataset) -> None:
+        validation_examples = self._select_validation_examples(
+            dataset
+        )
+        reference_validation_reward = self._validation_reward(
+            model=self.models.reference,
+            examples=validation_examples,
+        )
+        best_validation_reward = reference_validation_reward
+        best_actor_state = self._copy_state_dict(
+            self.models.actor
+        )
+        best_value_state = self._copy_state_dict(
+            self.models.value_head
+        )
+        best_episode = 0
+        checks_without_improvement = 0
+
+        print(
+            "Validation baseline | "
+            f"reference reward: {reference_validation_reward:.4f}"
+        )
+
         try:
             for episode in range(self.config.num_episodes):
                 examples = self._select_rollout_examples(dataset, episode)
@@ -51,6 +73,17 @@ class PPOTrainer:
                 )
 
                 metrics = self._rollout_metrics(rollout)
+                reference_kl = metrics["sampled_kl"]
+
+                if reference_kl > self.config.max_reference_kl:
+                    print(
+                        "Stopping before PPO update: reference KL "
+                        f"{reference_kl:.4f} exceeded safety limit "
+                        f"{self.config.max_reference_kl:.4f}."
+                    )
+                    break
+
+                metrics["kl_coef"] = self.config.kl_coef
                 metrics.update(self._ppo_update(rollout))
                 self.reporter.log_episode(episode, metrics)
                 self._print_episode(
@@ -58,6 +91,66 @@ class PPOTrainer:
                     metrics,
                     rollout.responses[0],
                 )
+
+                self._adjust_kl_coefficient(reference_kl)
+
+                if (
+                    episode + 1
+                ) % self.config.validation_interval != 0:
+                    continue
+
+                actor_validation_reward = self._validation_reward(
+                    model=self.models.actor,
+                    examples=validation_examples,
+                )
+                improved = actor_validation_reward > (
+                    best_validation_reward
+                    + self.config.min_validation_improvement
+                )
+
+                if improved:
+                    best_validation_reward = actor_validation_reward
+                    best_actor_state = self._copy_state_dict(
+                        self.models.actor
+                    )
+                    best_value_state = self._copy_state_dict(
+                        self.models.value_head
+                    )
+                    best_episode = episode + 1
+                    checks_without_improvement = 0
+                else:
+                    checks_without_improvement += 1
+
+                self.reporter.log_validation(
+                    episode=episode,
+                    reference_reward=reference_validation_reward,
+                    actor_reward=actor_validation_reward,
+                    best_reward=best_validation_reward,
+                )
+                print(
+                    f"Validation {episode + 1} | "
+                    f"actor reward: {actor_validation_reward:.4f} | "
+                    f"best reward: {best_validation_reward:.4f} | "
+                    f"best episode: {best_episode}"
+                )
+
+                if (
+                    checks_without_improvement
+                    >= self.config.early_stopping_patience
+                ):
+                    print(
+                        "Early stopping: validation reward did not "
+                        f"improve for {checks_without_improvement} "
+                        "checks."
+                    )
+                    break
+
+            self.models.actor.load_state_dict(best_actor_state)
+            self.models.value_head.load_state_dict(best_value_state)
+            print(
+                f"Restored best checkpoint from episode {best_episode} "
+                f"with validation reward {best_validation_reward:.4f}."
+            )
 
             self.save()
             evaluation_metrics = self._evaluate(dataset)
@@ -87,6 +180,76 @@ class PPOTrainer:
         ]
         return dataset.select(indices)
 
+    def _select_validation_examples(
+        self,
+        dataset: Dataset,
+    ) -> Dataset:
+        test_start = len(dataset) - self.config.num_eval_samples
+        validation_start = (
+            test_start - self.config.num_validation_samples
+        )
+        training_count = (
+            self.config.num_episodes
+            * self.config.rollout_batch_size
+        )
+
+        if training_count > validation_start:
+            raise ValueError(
+                "Training, validation, and test splits overlap."
+            )
+
+        return dataset.select(
+            range(validation_start, test_start)
+        )
+
+    @staticmethod
+    def _copy_state_dict(
+        model: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in model.state_dict().items()
+        }
+
+    def _validation_reward(
+        self,
+        model: torch.nn.Module,
+        examples: Dataset,
+    ) -> float:
+        raw_prompts = list(examples["raw_prompt"])
+        responses = generate_evaluation_responses(
+            model=model,
+            tokenizer=self.actor_tokenizer,
+            formatted_prompts=list(examples["formatted_prompt"]),
+            config=self.config,
+            device=self.models.device,
+        )
+        scores = score_responses(
+            models=self.models,
+            raw_prompts=raw_prompts,
+            responses=responses,
+            config=self.config,
+        )
+        return scores.mean().item()
+
+    def _adjust_kl_coefficient(
+        self,
+        reference_kl: float,
+    ) -> None:
+        if reference_kl <= self.config.target_reference_kl:
+            return
+
+        self.config.kl_coef = min(
+            self.config.kl_coef
+            * self.config.kl_coef_multiplier,
+            1.0,
+        )
+        print(
+            "Increasing KL coefficient to "
+            f"{self.config.kl_coef:.4f} because reference KL "
+            f"reached {reference_kl:.4f}."
+        )
+
     def _ppo_update(
         self,
         rollout: RolloutBatch,
@@ -95,7 +258,11 @@ class PPOTrainer:
         self.models.value_head.train()
         metrics: defaultdict[str, list[float]] = defaultdict(list)
 
+        ppo_epochs_used = 0
+        stop_early = False
+
         for _ in range(self.config.num_ppo_epochs):
+            epoch_approx_kl = []
             permutation = torch.randperm(
                 len(rollout),
                 device=self.models.device,
@@ -116,11 +283,29 @@ class PPOTrainer:
 
                 for name, value in minibatch_metrics.items():
                     metrics[name].append(value)
+                epoch_approx_kl.append(
+                    minibatch_metrics["approx_kl"]
+                )
 
-        return {
+                mean_epoch_kl = sum(epoch_approx_kl) / len(
+                    epoch_approx_kl
+                )
+                if mean_epoch_kl > self.config.target_kl:
+                    stop_early = True
+                    break
+
+            ppo_epochs_used += 1
+            if stop_early:
+                break
+
+        averaged_metrics = {
             name: sum(values) / len(values)
             for name, values in metrics.items()
         }
+        averaged_metrics["ppo_epochs_used"] = float(
+            ppo_epochs_used
+        )
+        return averaged_metrics
 
     def _update_minibatch(
         self,
@@ -138,16 +323,17 @@ class PPOTrainer:
         self.actor_optimizer.zero_grad(set_to_none=True)
         self.critic_optimizer.zero_grad(set_to_none=True)
 
-        actor_outputs = self.models.actor(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        current_logprobs = token_logprobs(
-            actor_outputs.logits,
-            input_ids,
-        ).float()
+        with autocast_context(self.models.device):
+            actor_outputs = self.models.actor(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            current_logprobs = token_logprobs(
+                actor_outputs.logits,
+                input_ids,
+            ).float()
 
         log_ratio = current_logprobs - old_logprobs
         ratio = log_ratio.exp()

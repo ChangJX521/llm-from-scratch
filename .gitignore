@@ -1,15 +1,25 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 .env
 .venv/
 venv/
+*.egg-info/
+build/
+dist/
 
 outputs/
 checkpoints/
+logs/
+runs/
 models/
 wandb/
+*.log
+events.out.tfevents*
 
 *.pt
 *.pth
@@ -18,3 +28,5 @@ wandb/
 
 .DS_Store
 .vscode/
+.agents/
+.codex/

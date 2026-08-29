@@ -31,6 +31,7 @@ class TrainingReporter:
         tensorboard_path = Path(config.tensorboard_dir) / run_name
         self.writer = SummaryWriter(log_dir=tensorboard_path)
         self.history: list[dict[str, float]] = []
+        self.validation_history: list[dict[str, float]] = []
 
     def log_episode(
         self,
@@ -48,6 +49,39 @@ class TrainingReporter:
                 value,
                 episode + 1,
             )
+        self.writer.flush()
+
+    def log_validation(
+        self,
+        episode: int,
+        reference_reward: float,
+        actor_reward: float,
+        best_reward: float,
+    ) -> None:
+        row = {
+            "episode": float(episode + 1),
+            "reference_reward": reference_reward,
+            "actor_reward": actor_reward,
+            "best_reward": best_reward,
+        }
+        self.validation_history.append(row)
+        self._write_validation_csv()
+
+        self.writer.add_scalar(
+            "validation/reference_reward",
+            reference_reward,
+            episode + 1,
+        )
+        self.writer.add_scalar(
+            "validation/actor_reward",
+            actor_reward,
+            episode + 1,
+        )
+        self.writer.add_scalar(
+            "validation/best_reward",
+            best_reward,
+            episode + 1,
+        )
         self.writer.flush()
 
     def log_evaluation(
@@ -121,6 +155,15 @@ class TrainingReporter:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.history)
+
+    def _write_validation_csv(self) -> None:
+        path = self.report_dir / "validation.csv"
+        fieldnames = list(self.validation_history[0])
+
+        with path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.validation_history)
 
     def _write_evaluation_csv(
         self,
